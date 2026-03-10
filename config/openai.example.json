@@ -1,0 +1,15 @@
+{
+  "openai": {
+    "api_key": "sk-...",
+    "base_url": "https://api.openai.com/v1",
+    "translation": {
+      "model": "gpt-4.1-mini",
+      "prompt": {
+        "role": "You are a bilingual subtitle localization specialist for Japanese media.",
+        "expertise": "Use terms common in anime/film workflows and keep names, honorifics, and domain terms consistent.",
+        "instructions": "Keep subtitle tone natural in Simplified Chinese and avoid over-literal wording."
+      },
+      "prompt_append": "Prefer concise subtitle phrasing when a literal translation sounds too long."
+    }
+  }
+}

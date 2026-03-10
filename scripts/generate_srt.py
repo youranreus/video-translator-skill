@@ -3,23 +3,24 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "faster-whisper>=1.0.0",
+#     "openai>=1.60.0",
 # ]
 # ///
 """
 Transcription with subtitles. Hebrew uses ivrit.ai, English uses whisper large-v3.
 
 Usage: 
-    ./transcribe.py video.mp4                      # Plain transcript
-    ./transcribe.py video.mp4 --srt                # Generate SRT file
-    ./transcribe.py video.mp4 --srt --embed        # Burn subtitles into video
-    ./transcribe.py video.mp4 --srt --translate en # Translate to English
+    ./scripts/generate_srt.py video.mp4                      # Plain transcript
+    ./scripts/generate_srt.py video.mp4 --srt                # Generate SRT file
+    ./scripts/generate_srt.py video.mp4 --srt --embed        # Burn subtitles into video
+    ./scripts/generate_srt.py video.mp4 --srt --translate en # Translate to English
 """
 
 import sys
 import os
 import argparse
+import json
 import subprocess
-import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -35,6 +36,32 @@ class Subtitle:
         return f"{self.index}\n{format_srt_timestamp(self.start)} --> {format_srt_timestamp(self.end)}\n{self.text}\n"
 
 
+LANGUAGE_NAMES = {
+    "he": "Hebrew",
+    "en": "English",
+    "ja": "Japanese",
+    "zh": "Simplified Chinese",
+}
+
+SUBTITLE_LANG_TAGS = {
+    "he": "heb",
+    "en": "eng",
+    "ja": "jpn",
+    "zh": "zho",
+}
+
+DEFAULT_OPENAI_CONFIG_PATH = "config/openai.json"
+DEFAULT_TRANSLATION_MODEL = "gpt-4.1-mini"
+
+
+@dataclass
+class OpenAIConfig:
+    api_key: str
+    base_url: str | None
+    translation_model: str | None
+    translation_prompt_extra: str | None
+
+
 def format_srt_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -48,7 +75,10 @@ def chunk_text_naturally(text: str, max_chars: int = 42) -> list[str]:
     if len(text) <= max_chars:
         return [text]
     
-    break_points = ['. ', ', ', '? ', '! ', ': ', '; ', ' - ', ' – ', ' — ']
+    break_points = [
+        ". ", ", ", "? ", "! ", ": ", "; ", " - ", " – ", " — ",
+        "。", "，", "？", "！", "：", "；", "、",
+    ]
     lines = []
     remaining = text
     
@@ -60,8 +90,10 @@ def chunk_text_naturally(text: str, max_chars: int = 42) -> list[str]:
         best_break = -1
         for bp in break_points:
             idx = remaining[:max_chars].rfind(bp)
-            if idx > best_break:
-                best_break = idx + len(bp) - 1
+            if idx >= 0:
+                candidate_break = idx + len(bp.rstrip())
+                if candidate_break > best_break:
+                    best_break = candidate_break
         
         if best_break <= 0:
             best_break = remaining[:max_chars].rfind(' ')
@@ -123,7 +155,7 @@ def merge_into_subtitles(segments: list, min_duration: float = 1.0, max_duration
     return subtitles
 
 
-def transcribe(file_path: str, language: str | None = None, use_turbo: bool = True, 
+def transcribe(file_path: str, language: str | None = None, use_turbo: bool = True,
                generate_srt: bool = False, translate_to: str | None = None):
     """Transcribe audio/video file. Auto-detects language, uses ivrit.ai for Hebrew."""
     from faster_whisper import WhisperModel
@@ -173,12 +205,185 @@ def transcribe(file_path: str, language: str | None = None, use_turbo: bool = Tr
     if generate_srt:
         subtitles = merge_into_subtitles(raw_segments)
         print(f"✓ Created {len(subtitles)} subtitles", file=sys.stderr)
-        return '\n'.join(sub.to_srt() for sub in subtitles), subtitles[-1].end if subtitles else 0, detected_lang
+        return '\n'.join(sub.to_srt() for sub in subtitles), subtitles[-1].end if subtitles else 0, detected_lang, subtitles
     
-    return " ".join(seg.text.strip() for seg in raw_segments), None, detected_lang
+    return " ".join(seg.text.strip() for seg in raw_segments), None, detected_lang, None
 
 
-def embed_subtitles(video_path: str, srt_content: str, output_path: str, burn: bool = False):
+def load_app_config(config_path: str) -> dict:
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in config file {config_path}: {exc}") from exc
+    raise RuntimeError(f"Config file must contain a JSON object: {config_path}")
+
+
+def clean_optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+def build_translation_prompt_extra(translation_cfg: dict) -> str | None:
+    prompt_parts: list[str] = []
+
+    prompt_append = clean_optional_text(translation_cfg.get("prompt_append"))
+    if prompt_append:
+        prompt_parts.append(prompt_append)
+
+    prompt_cfg = translation_cfg.get("prompt")
+    if isinstance(prompt_cfg, str):
+        prompt_text = clean_optional_text(prompt_cfg)
+        if prompt_text:
+            prompt_parts.append(prompt_text)
+    elif isinstance(prompt_cfg, dict):
+        for key in ("role", "expertise", "instructions"):
+            section_text = clean_optional_text(prompt_cfg.get(key))
+            if section_text:
+                prompt_parts.append(section_text)
+    elif prompt_cfg is not None:
+        raise RuntimeError("Invalid config: 'openai.translation.prompt' must be a string or object")
+
+    if not prompt_parts:
+        return None
+    return "\n\n".join(prompt_parts)
+
+
+def resolve_openai_config(config: dict) -> OpenAIConfig:
+    openai_cfg = config.get("openai", {})
+    if not isinstance(openai_cfg, dict):
+        raise RuntimeError("Invalid config: 'openai' must be an object")
+
+    api_key = openai_cfg.get("api_key") or os.getenv("OPENAI_API_KEY")
+    base_url = openai_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
+    translation_cfg = openai_cfg.get("translation", {})
+    if translation_cfg is None:
+        translation_cfg = {}
+    if not isinstance(translation_cfg, dict):
+        raise RuntimeError("Invalid config: 'openai.translation' must be an object")
+
+    translation_model = (
+        clean_optional_text(translation_cfg.get("model"))
+        or clean_optional_text(openai_cfg.get("translation_model"))
+    )
+    translation_prompt_extra = build_translation_prompt_extra(translation_cfg)
+
+    if not api_key:
+        raise RuntimeError(
+            "Missing OpenAI API key. Set openai.api_key in config file or OPENAI_API_KEY environment variable."
+        )
+    return OpenAIConfig(
+        api_key=api_key,
+        base_url=base_url,
+        translation_model=translation_model,
+        translation_prompt_extra=translation_prompt_extra,
+    )
+
+
+def translate_text_with_openai(
+    text: str,
+    source_lang: str | None,
+    target_lang: str,
+    model: str,
+    openai_config: OpenAIConfig,
+) -> str:
+    if not text.strip():
+        return text
+
+    from openai import OpenAI
+
+    source_name = LANGUAGE_NAMES.get(source_lang, source_lang or "auto-detected language")
+    target_name = LANGUAGE_NAMES.get(target_lang, target_lang)
+    client_kwargs = {"api_key": openai_config.api_key}
+    if openai_config.base_url:
+        client_kwargs["base_url"] = openai_config.base_url
+    client = OpenAI(**client_kwargs)
+    system_prompt = (
+        "You are a subtitle translator. Keep meaning and tone faithful, "
+        "preserve line breaks, and do not add commentary."
+    )
+    if openai_config.translation_prompt_extra:
+        system_prompt = f"{system_prompt}\n\nAdditional translation guidance:\n{openai_config.translation_prompt_extra}"
+
+    response = client.responses.create(
+        model=model,
+        temperature=0,
+        input=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": f"Translate from {source_name} to {target_name}. Return only translated text.",
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ],
+    )
+    translated = response.output_text.strip()
+    if not translated:
+        raise RuntimeError("OpenAI returned empty translation output")
+    return translated
+
+
+def translate_subtitles(
+    subtitles: list[Subtitle],
+    source_lang: str | None,
+    target_lang: str,
+    model: str,
+    openai_config: OpenAIConfig,
+) -> list[Subtitle]:
+    translated = []
+    cache: dict[str, str] = {}
+    total = len(subtitles)
+
+    print(f"🌐 Translating {total} subtitle lines to {LANGUAGE_NAMES.get(target_lang, target_lang)}...", file=sys.stderr)
+    for idx, sub in enumerate(subtitles, 1):
+        original_text = sub.text
+        translated_text = cache.get(original_text)
+        if translated_text is None:
+            translated_text = translate_text_with_openai(
+                original_text,
+                source_lang,
+                target_lang,
+                model,
+                openai_config,
+            )
+            cache[original_text] = translated_text
+
+        translated.append(
+            Subtitle(
+                index=sub.index,
+                start=sub.start,
+                end=sub.end,
+                text=translated_text,
+            )
+        )
+
+        if idx % 20 == 0 or idx == total:
+            print(f"  ↳ translated {idx}/{total}", file=sys.stderr)
+
+    return translated
+
+
+def get_subtitle_language_tag(detected_lang: str | None, translate_to: str | None) -> str:
+    lang = translate_to or detected_lang
+    if not lang:
+        return "und"
+    return SUBTITLE_LANG_TAGS.get(lang, "und")
+
+
+def embed_subtitles(video_path: str, srt_content: str, output_path: str, subtitle_lang_tag: str, burn: bool = False):
     """Embed subtitles into video using ffmpeg."""
     # Use ffmpeg-full if available (has libass for burn-in)
     ffmpeg_bin = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
@@ -214,7 +419,7 @@ def embed_subtitles(video_path: str, srt_content: str, output_path: str, burn: b
                 '-i', srt_path,
                 '-c', 'copy',
                 '-c:s', 'mov_text',
-                '-metadata:s:s:0', 'language=heb',
+                '-metadata:s:s:0', f'language={subtitle_lang_tag}',
                 output_path
             ]
         
@@ -239,13 +444,15 @@ def main():
 Examples:
   %(prog)s video.mp4                        # Transcribe (auto-detect language)
   %(prog)s video.mp4 --lang he              # Force Hebrew
+  %(prog)s video.mp4 --lang ja              # Force Japanese
   %(prog)s video.mp4 --srt                  # Generate SRT subtitles
   %(prog)s video.mp4 --srt --embed          # Burn subtitles into video
   %(prog)s video.mp4 --srt --translate en   # Translate to English subtitles
+  %(prog)s video.mp4 --srt --translate zh   # Translate to Simplified Chinese subtitles
         """
     )
     parser.add_argument("file", help="Audio or video file")
-    parser.add_argument("--lang", "-l", choices=["he", "en"],
+    parser.add_argument("--lang", "-l", choices=["he", "en", "ja"],
                        help="Force language (auto-detect if not specified)")
     parser.add_argument("--turbo", action="store_true", default=True, 
                        help="Use turbo model for Hebrew (faster, default)")
@@ -259,8 +466,10 @@ Examples:
                        help="Embed soft subtitles into video (toggle in player)")
     parser.add_argument("--burn", action="store_true",
                        help="Burn subtitles into video (always visible, for WhatsApp)")
-    parser.add_argument("--translate", metavar="LANG", choices=["en"],
-                       help="Translate subtitles to language (currently: en)")
+    parser.add_argument("--translate", metavar="LANG", choices=["en", "zh"],
+                       help="Translate subtitles to language (currently: en, zh)")
+    parser.add_argument("--translation-model", default=None,
+                       help="LLM model used for --translate zh (overrides config)")
     parser.add_argument("--output", "-o", help="Output file path")
     
     args = parser.parse_args()
@@ -275,13 +484,48 @@ Examples:
         sys.exit(1)
     
     use_turbo = not args.accurate
-    result, duration, detected_lang = transcribe(
+    result, duration, detected_lang, subtitles = transcribe(
         args.file, 
         language=args.lang,
         use_turbo=use_turbo, 
         generate_srt=args.srt,
         translate_to=args.translate
     )
+
+    openai_config = None
+    translation_model = args.translation_model
+    if args.translate == "zh":
+        try:
+            app_config = load_app_config(DEFAULT_OPENAI_CONFIG_PATH)
+            openai_config = resolve_openai_config(app_config)
+            if not translation_model:
+                translation_model = openai_config.translation_model or DEFAULT_TRANSLATION_MODEL
+            print(f"🤖 Translation model: {translation_model}", file=sys.stderr)
+            if detected_lang != "ja":
+                print("⚠️  Detected source is not Japanese. Continuing with source -> zh translation.", file=sys.stderr)
+            if args.srt:
+                if subtitles is None:
+                    print("❌ Internal error: missing subtitles for zh translation", file=sys.stderr)
+                    sys.exit(1)
+                translated_subtitles = translate_subtitles(
+                    subtitles=subtitles,
+                    source_lang=detected_lang,
+                    target_lang="zh",
+                    model=translation_model,
+                    openai_config=openai_config,
+                )
+                result = '\n'.join(sub.to_srt() for sub in translated_subtitles)
+            else:
+                result = translate_text_with_openai(
+                    text=result,
+                    source_lang=detected_lang,
+                    target_lang="zh",
+                    model=translation_model,
+                    openai_config=openai_config,
+                )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            sys.exit(1)
     
     # Determine output path
     if args.output:
@@ -294,8 +538,9 @@ Examples:
         output_path = None
     
     # Handle embedding
+    subtitle_lang_tag = get_subtitle_language_tag(detected_lang, args.translate)
     if args.embed or args.burn:
-        embed_subtitles(str(input_path), result, str(output_path), burn=args.burn)
+        embed_subtitles(str(input_path), result, str(output_path), subtitle_lang_tag=subtitle_lang_tag, burn=args.burn)
     elif output_path:
         output_path.write_text(result, encoding="utf-8")
         print(f"✓ Saved: {output_path}", file=sys.stderr)
