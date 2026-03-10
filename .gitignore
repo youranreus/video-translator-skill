@@ -1,1 +1,4 @@
 config/openai.json
+test
+.env
+.DS_Store
