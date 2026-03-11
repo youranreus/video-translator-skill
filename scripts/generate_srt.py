@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 SRT_TIMESTAMP_PATTERN = re.compile(
     r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})$"
 )
+FONT_EXTENSIONS = {".ttf", ".otf", ".ttc", ".otc"}
 
 
 @dataclass
@@ -69,6 +71,78 @@ class RuntimeConfig:
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def quote_ffmpeg_filter_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def escape_ass_style_value(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(",", "\\,")
+        .replace("'", "\\'")
+    )
+
+
+def detect_project_fonts() -> tuple[Path | None, str | None]:
+    project_root = Path(__file__).resolve().parent.parent
+    fonts_dir = project_root / "fonts"
+    if not fonts_dir.is_dir():
+        return None, None
+
+    font_files = sorted(
+        file
+        for file in fonts_dir.iterdir()
+        if file.is_file() and file.suffix.lower() in FONT_EXTENSIONS
+    )
+    if not font_files:
+        return None, None
+
+    # 使用文件名推断 FontName，配合 fontsdir 提高命中概率。
+    font_name = font_files[0].stem.replace("_", " ").strip()
+    return fonts_dir, font_name or None
+
+
+def resolve_ffmpeg_bin() -> str:
+    env_bin = clean_optional_text(os.getenv("FFMPEG_BIN"))
+    candidates = [
+        env_bin,
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.sep in candidate:
+            if os.path.exists(candidate):
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return "ffmpeg"
+
+
+def ffmpeg_has_filter(ffmpeg_bin: str, filter_name: str) -> bool:
+    result = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        columns = line.split()
+        if len(columns) >= 2 and columns[1] == filter_name:
+            return True
+    return False
 
 
 def format_srt_timestamp(seconds: float) -> str:
@@ -509,9 +583,8 @@ def embed_subtitles(
     subtitle_lang: str,
     burn: bool = False,
 ) -> None:
-    ffmpeg_bin = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
-    if not os.path.exists(ffmpeg_bin):
-        ffmpeg_bin = "ffmpeg"
+    ffmpeg_bin = resolve_ffmpeg_bin()
+    log(f"使用 ffmpeg: {ffmpeg_bin}")
 
     with tempfile.NamedTemporaryFile("w", suffix=".srt", encoding="utf-8", delete=False) as temp_srt:
         temp_srt.write(srt_content)
@@ -520,14 +593,43 @@ def embed_subtitles(
     try:
         if burn:
             log("开始烧录字幕到视频。")
-            escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:")
-            filter_str = (
-                "subtitles="
-                f"{escaped_srt}:"
-                "force_style='FontSize=12,PrimaryColour=&Hffffff,"
-                "OutlineColour=&H000000,BorderStyle=1,Outline=1,Shadow=0,"
-                "MarginV=12,Alignment=2'"
+            if not ffmpeg_has_filter(ffmpeg_bin, "subtitles"):
+                raise RuntimeError(
+                    "当前 ffmpeg 不支持 subtitles 过滤器，无法烧录字幕。\n"
+                    f"当前 ffmpeg: {ffmpeg_bin}\n"
+                    "请安装 ffmpeg-full（含 libass）后重试，或通过 FFMPEG_BIN "
+                    "指定支持 subtitles 的 ffmpeg 可执行文件。"
+                )
+            filter_options = [f"filename={quote_ffmpeg_filter_value(srt_path)}"]
+            fonts_dir, font_name = detect_project_fonts()
+            if fonts_dir:
+                filter_options.append(
+                    f"fontsdir={quote_ffmpeg_filter_value(str(fonts_dir))}"
+                )
+                log(f"烧录字幕将加载字体目录: {fonts_dir}")
+            else:
+                log("未检测到项目 fonts 目录中的字体文件，使用系统默认字体。")
+
+            style_parts = []
+            if font_name:
+                style_parts.append(f"Fontname={escape_ass_style_value(font_name)}")
+                log(f"烧录字幕优先使用字体: {font_name}")
+            style_parts.extend(
+                [
+                    "FontSize=12",
+                    "PrimaryColour=&Hffffff",
+                    "OutlineColour=&H000000",
+                    "BorderStyle=1",
+                    "Outline=1",
+                    "Shadow=0",
+                    "MarginV=12",
+                    "Alignment=2",
+                ]
             )
+            filter_options.append(
+                f"force_style={quote_ffmpeg_filter_value(','.join(style_parts))}"
+            )
+            filter_str = f"subtitles={':'.join(filter_options)}"
             cmd = [
                 ffmpeg_bin,
                 "-y",
