@@ -1,0 +1,17 @@
+{
+  "style": {
+    "Fontname": "ChillRoundGothic",
+    "FontSize": 12,
+    "PrimaryColour": "&H000000",
+    "OutlineColour": "&H40FFFFFF",
+    "BorderStyle": 1,
+    "Outline": 1,
+    "Shadow": 0
+  },
+  "position": {
+    "Alignment": 2,
+    "MarginV": 25,
+    "MarginL": 0,
+    "MarginR": 0
+  }
+}

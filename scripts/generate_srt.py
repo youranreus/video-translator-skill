@@ -36,11 +36,54 @@ from pathlib import Path
 DEFAULT_SOURCE_LANG = "ja"
 DEFAULT_TARGET_LANG = "zh"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+SUBTITLE_PRESET_DIR_NAME = "subtitlePreset"
 
 SRT_TIMESTAMP_PATTERN = re.compile(
     r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})$"
 )
 FONT_EXTENSIONS = {".ttf", ".otf", ".ttc", ".otc"}
+STYLE_FIELD_ORDER = [
+    "Fontname",
+    "FontSize",
+    "PrimaryColour",
+    "OutlineColour",
+    "BorderStyle",
+    "Outline",
+    "Shadow",
+]
+POSITION_FIELD_ORDER = [
+    "MarginV",
+    "Alignment",
+    "MarginL",
+    "MarginR",
+]
+STYLE_FIELD_TYPES = {
+    "Fontname": "string",
+    "FontSize": "number",
+    "PrimaryColour": "string",
+    "OutlineColour": "string",
+    "BorderStyle": "integer",
+    "Outline": "number",
+    "Shadow": "number",
+}
+POSITION_FIELD_TYPES = {
+    "Alignment": "integer",
+    "MarginV": "integer",
+    "MarginL": "integer",
+    "MarginR": "integer",
+}
+DEFAULT_BURN_STYLE = {
+    "FontSize": 12,
+    "PrimaryColour": "&Hffffff",
+    "OutlineColour": "&H000000",
+    "BorderStyle": 1,
+    "Outline": 1,
+    "Shadow": 0,
+}
+DEFAULT_BURN_POSITION = {
+    "MarginV": 12,
+    "Alignment": 2,
+}
 
 
 @dataclass
@@ -69,6 +112,14 @@ class RuntimeConfig:
     use_turbo: bool
 
 
+@dataclass(frozen=True)
+class SubtitlePreset:
+    name: str
+    path: Path
+    style: dict[str, str | int | float]
+    position: dict[str, str | int | float]
+
+
 def log(message: str) -> None:
     print(message, file=sys.stderr)
 
@@ -86,9 +137,12 @@ def escape_ass_style_value(value: str) -> str:
     )
 
 
+def get_project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
 def detect_project_fonts() -> tuple[Path | None, str | None]:
-    project_root = Path(__file__).resolve().parent.parent
-    fonts_dir = project_root / "fonts"
+    fonts_dir = get_project_root() / "fonts"
     if not fonts_dir.is_dir():
         return None, None
 
@@ -103,6 +157,179 @@ def detect_project_fonts() -> tuple[Path | None, str | None]:
     # 使用文件名推断 FontName，配合 fontsdir 提高命中概率。
     font_name = font_files[0].stem.replace("_", " ").strip()
     return fonts_dir, font_name or None
+
+
+def get_subtitle_preset_dir() -> Path:
+    return get_project_root() / SUBTITLE_PRESET_DIR_NAME
+
+
+def list_available_subtitle_presets(preset_dir: Path | None = None) -> list[str]:
+    current_preset_dir = preset_dir or get_subtitle_preset_dir()
+    if not current_preset_dir.is_dir():
+        return []
+    return sorted(
+        file.stem
+        for file in current_preset_dir.iterdir()
+        if file.is_file() and file.suffix.lower() == ".json"
+    )
+
+
+def validate_subtitle_preset_value(
+    preset_name: str,
+    section_name: str,
+    field_name: str,
+    value: object,
+    expected_type: str,
+) -> str | int | float:
+    if expected_type == "string":
+        if not isinstance(value, str):
+            raise ValueError(
+                f"字幕预设 {preset_name} 的 {section_name}.{field_name} 必须是字符串"
+            )
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(
+                f"字幕预设 {preset_name} 的 {section_name}.{field_name} 不能为空"
+            )
+        return cleaned
+
+    if isinstance(value, bool):
+        raise ValueError(
+            f"字幕预设 {preset_name} 的 {section_name}.{field_name} 不能是布尔值"
+        )
+
+    if expected_type == "integer":
+        if not isinstance(value, int):
+            raise ValueError(
+                f"字幕预设 {preset_name} 的 {section_name}.{field_name} 必须是整数"
+            )
+        return value
+
+    if expected_type == "number":
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"字幕预设 {preset_name} 的 {section_name}.{field_name} 必须是数字"
+            )
+        return value
+
+    raise ValueError(f"未知的预设字段类型: {expected_type}")
+
+
+def validate_subtitle_preset_section(
+    preset_name: str,
+    section_name: str,
+    value: object,
+    expected_fields: dict[str, str],
+) -> dict[str, str | int | float]:
+    if not isinstance(value, dict):
+        raise ValueError(f"字幕预设 {preset_name} 的 {section_name} 必须是对象")
+
+    unknown_fields = sorted(set(value) - set(expected_fields))
+    if unknown_fields:
+        raise ValueError(
+            f"字幕预设 {preset_name} 的 {section_name} 包含未知字段: "
+            f"{', '.join(unknown_fields)}"
+        )
+
+    validated: dict[str, str | int | float] = {}
+    for field_name, raw_value in value.items():
+        validated[field_name] = validate_subtitle_preset_value(
+            preset_name=preset_name,
+            section_name=section_name,
+            field_name=field_name,
+            value=raw_value,
+            expected_type=expected_fields[field_name],
+        )
+    return validated
+
+
+def load_subtitle_preset(
+    preset_name: str,
+    preset_dir: Path | None = None,
+) -> SubtitlePreset:
+    current_preset_dir = preset_dir or get_subtitle_preset_dir()
+    preset_path = current_preset_dir / f"{preset_name}.json"
+    if not preset_path.is_file():
+        available_presets = list_available_subtitle_presets(current_preset_dir)
+        available_text = ", ".join(available_presets) if available_presets else "无"
+        raise FileNotFoundError(
+            f"字幕预设不存在: {preset_path}（可用预设: {available_text}）"
+        )
+
+    try:
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"字幕预设 {preset_name} JSON 解析失败: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"字幕预设 {preset_name} 的顶层结构必须是对象")
+
+    missing_sections = [name for name in ("style", "position") if name not in data]
+    if missing_sections:
+        raise ValueError(
+            f"字幕预设 {preset_name} 缺少必填字段: {', '.join(missing_sections)}"
+        )
+
+    unknown_sections = sorted(set(data) - {"style", "position"})
+    if unknown_sections:
+        raise ValueError(
+            f"字幕预设 {preset_name} 包含未知顶层字段: "
+            f"{', '.join(unknown_sections)}"
+        )
+
+    return SubtitlePreset(
+        name=preset_name,
+        path=preset_path,
+        style=validate_subtitle_preset_section(
+            preset_name=preset_name,
+            section_name="style",
+            value=data["style"],
+            expected_fields=STYLE_FIELD_TYPES,
+        ),
+        position=validate_subtitle_preset_section(
+            preset_name=preset_name,
+            section_name="position",
+            value=data["position"],
+            expected_fields=POSITION_FIELD_TYPES,
+        ),
+    )
+
+
+def format_ass_style_part(field_name: str, value: str | int | float) -> str:
+    return f"{field_name}={escape_ass_style_value(str(value))}"
+
+
+def build_burn_force_style(
+    font_name: str | None,
+    subtitle_preset: str | None = None,
+    preset_dir: Path | None = None,
+) -> tuple[str, SubtitlePreset | None]:
+    style: dict[str, str | int | float] = dict(DEFAULT_BURN_STYLE)
+    position: dict[str, str | int | float] = dict(DEFAULT_BURN_POSITION)
+    loaded_preset: SubtitlePreset | None = None
+
+    if subtitle_preset:
+        loaded_preset = load_subtitle_preset(subtitle_preset, preset_dir=preset_dir)
+        style.update(loaded_preset.style)
+        position.update(loaded_preset.position)
+
+    if "Fontname" not in style and font_name:
+        style["Fontname"] = font_name
+
+    style_parts = [
+        format_ass_style_part(field_name, style[field_name])
+        for field_name in STYLE_FIELD_ORDER
+        if field_name in style
+    ]
+    style_parts.extend(
+        format_ass_style_part(field_name, position[field_name])
+        for field_name in POSITION_FIELD_ORDER
+        if field_name in position
+    )
+    return ",".join(style_parts), loaded_preset
 
 
 def resolve_ffmpeg_bin() -> str:
@@ -582,6 +809,7 @@ def embed_subtitles(
     output_path: str,
     subtitle_lang: str,
     burn: bool = False,
+    subtitle_preset: str | None = None,
 ) -> None:
     ffmpeg_bin = resolve_ffmpeg_bin()
     log(f"使用 ffmpeg: {ffmpeg_bin}")
@@ -610,24 +838,16 @@ def embed_subtitles(
             else:
                 log("未检测到项目 fonts 目录中的字体文件，使用系统默认字体。")
 
-            style_parts = []
-            if font_name:
-                style_parts.append(f"Fontname={escape_ass_style_value(font_name)}")
-                log(f"烧录字幕优先使用字体: {font_name}")
-            style_parts.extend(
-                [
-                    "FontSize=12",
-                    "PrimaryColour=&Hffffff",
-                    "OutlineColour=&H000000",
-                    "BorderStyle=1",
-                    "Outline=1",
-                    "Shadow=0",
-                    "MarginV=12",
-                    "Alignment=2",
-                ]
+            force_style, loaded_preset = build_burn_force_style(
+                font_name=font_name,
+                subtitle_preset=subtitle_preset,
             )
+            if loaded_preset:
+                log(f"烧录字幕预设已加载: {loaded_preset.path}")
+            elif font_name:
+                log(f"烧录字幕优先使用字体: {font_name}")
             filter_options.append(
-                f"force_style={quote_ffmpeg_filter_value(','.join(style_parts))}"
+                f"force_style={quote_ffmpeg_filter_value(force_style)}"
             )
             filter_str = f"subtitles={':'.join(filter_options)}"
             cmd = [
@@ -672,6 +892,26 @@ def is_srt_input(file_path: Path) -> bool:
     return file_path.suffix.lower() == ".srt"
 
 
+def resolve_external_subtitle_file(
+    input_path: Path,
+    subtitle_file: str | None,
+    package_subtitles: bool,
+) -> Path | None:
+    if not subtitle_file:
+        return None
+
+    subtitle_path = Path(subtitle_file)
+    if not subtitle_path.exists():
+        raise FileNotFoundError(f"字幕文件不存在: {subtitle_file}")
+    if not is_srt_input(subtitle_path):
+        raise ValueError(f"字幕文件必须是 .srt: {subtitle_file}")
+    if is_srt_input(input_path):
+        raise ValueError("输入文件为 SRT 时，不能同时使用 --subtitle-file")
+    if not package_subtitles:
+        raise ValueError("--subtitle-file 仅可与 --embed 或 --burn 搭配使用")
+    return subtitle_path
+
+
 def load_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     from dotenv import load_dotenv
 
@@ -705,6 +945,8 @@ def main() -> None:
   %(prog)s input.mp4
   %(prog)s input.srt
   %(prog)s input.mp4 --burn
+  %(prog)s input.mp4 --burn --subtitlePreset default
+  %(prog)s input.mp4 --subtitle-file input.zh.srt --burn --subtitlePreset shioneru
   %(prog)s input.mp4 --openai-model gpt-4o-mini
   %(prog)s input.mp4 --openai-base-url https://your.endpoint/v1 --openai-api-key xxx
         """,
@@ -750,6 +992,17 @@ def main() -> None:
         default=20,
         help="批量翻译的字幕条数（默认 20）",
     )
+    parser.add_argument(
+        "--subtitlePreset",
+        help=(
+            f"烧录字幕样式预设名（查找 {SUBTITLE_PRESET_DIR_NAME}/<name>.json，"
+            "仅对 --burn 生效）"
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-file",
+        help="已有 SRT 字幕文件路径；与视频输入配合时可直接 --embed/--burn，跳过转录和翻译",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--embed",
@@ -772,6 +1025,16 @@ def main() -> None:
         log("错误: --batch-size 必须大于 0")
         sys.exit(1)
 
+    try:
+        external_subtitle_path = resolve_external_subtitle_file(
+            input_path=input_path,
+            subtitle_file=args.subtitle_file,
+            package_subtitles=args.embed or args.burn,
+        )
+    except Exception as exc:
+        log(f"错误: {exc}")
+        sys.exit(1)
+
     config = load_runtime_config(args)
     log(
         "运行配置: "
@@ -789,10 +1052,21 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        if is_srt_input(input_path):
+        source_subtitles: list[Subtitle] | None = None
+        if external_subtitle_path:
+            log("检测到视频 + 外部 SRT 输入，跳过转录和翻译阶段。")
+            target_subtitles = parse_srt_file(external_subtitle_path)
+            log(f"读取外部字幕完成，条数: {len(target_subtitles)}")
+        elif is_srt_input(input_path):
             log("检测到 SRT 输入，跳过转录阶段。")
             source_subtitles = parse_srt_file(input_path)
             log(f"读取源字幕完成，条数: {len(source_subtitles)}")
+            target_subtitles = translate_subtitles(
+                subtitles=source_subtitles,
+                config=config,
+                batch_size=args.batch_size,
+            )
+            log(f"翻译阶段完成，目标字幕条数: {len(target_subtitles)}")
         else:
             log("检测到媒体输入，开始转录。")
             source_subtitles, _, detected_lang = transcribe_media(
@@ -801,38 +1075,45 @@ def main() -> None:
                 use_turbo=config.use_turbo,
             )
             log(f"转录阶段完成（识别语言: {detected_lang}）")
+            if not source_subtitles:
+                raise RuntimeError("没有可用的源字幕数据")
+            target_subtitles = translate_subtitles(
+                subtitles=source_subtitles,
+                config=config,
+                batch_size=args.batch_size,
+            )
+            log(f"翻译阶段完成，目标字幕条数: {len(target_subtitles)}")
 
-        if not source_subtitles:
-            raise RuntimeError("没有可用的源字幕数据")
-
-        target_subtitles = translate_subtitles(
-            subtitles=source_subtitles,
-            config=config,
-            batch_size=args.batch_size,
-        )
-        log(f"翻译阶段完成，目标字幕条数: {len(target_subtitles)}")
+        if not target_subtitles:
+            raise RuntimeError("没有可用的目标字幕数据")
 
         output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
 
         base_name = input_path.stem
-        source_srt_path = output_dir / f"{base_name}.{config.source_lang}.srt"
         target_srt_path = output_dir / f"{base_name}.{config.target_lang}.srt"
+        target_srt_content = subtitles_to_srt(target_subtitles)
 
-        source_srt_path.write_text(subtitles_to_srt(source_subtitles), encoding="utf-8")
-        target_srt_path.write_text(subtitles_to_srt(target_subtitles), encoding="utf-8")
+        if source_subtitles is not None:
+            source_srt_path = output_dir / f"{base_name}.{config.source_lang}.srt"
+            source_srt_path.write_text(
+                subtitles_to_srt(source_subtitles),
+                encoding="utf-8",
+            )
+            log(f"已输出源语言字幕: {source_srt_path}")
 
-        log(f"已输出源语言字幕: {source_srt_path}")
+        target_srt_path.write_text(target_srt_content, encoding="utf-8")
         log(f"已输出目标语言字幕: {target_srt_path}")
 
         if args.embed or args.burn:
             output_video = output_dir / f"{base_name}_subtitled.mp4"
             embed_subtitles(
                 video_path=str(input_path),
-                srt_content=subtitles_to_srt(target_subtitles),
+                srt_content=target_srt_content,
                 output_path=str(output_video),
                 subtitle_lang=config.target_lang,
                 burn=args.burn,
+                subtitle_preset=args.subtitlePreset if args.burn else None,
             )
     except Exception as exc:
         log(f"执行失败: {exc}")
